@@ -64,6 +64,12 @@ oura --key-file key.hex features --enable-hr --enable-spo2
 # history can be dated (--no-sync-time to skip) and asks the ring to postprocess sleep.
 oura --name "Oura Ring Gen3" --key-file key.hex --db oura.db sync
 
+# Keep syncing in the background (connect → drain → disconnect → wait → repeat), so
+# you don't have to park the ring on the charger. Unreachable passes back off and
+# retry, a pass that hangs is abandoned after 10 minutes, and the cursor is persisted
+# so nothing is missed. Ctrl-C to stop.
+oura --key-file key.hex --db oura.db watch --interval 300
+
 # Latest cached HR / SpO2 values (ring must be worn)
 oura --key-file key.hex latest
 

@@ -161,6 +161,18 @@ Validation on 2026-07-01:
 - A small periodic worker refreshes battery only; the real data sync is
   connection-/lifecycle-triggered, not a fixed timer.
 
+An independent client has no app lifecycle to ride, so `oura watch` supplies the
+equivalent: it reconnects, runs one `sync_once` pass (the recipe below), disconnects,
+and waits `--interval` before the next. The ring is only reliably connectable on its
+charger — worn, it advertises weakly and a phone may hold its single peripheral link
+— so a pass that can't reach it is expected: `watch` backs off (doubling up to
+`--max-backoff`) and retries rather than failing. Because the drain is cursor-based,
+missed passes lose nothing; the next successful pass resumes from the persisted
+`nextEventToSync`. Each pass is also capped at 10 minutes: unlike connect,
+`BleTransport::write` (GATT write-with-response) has no deadline of its own, and on
+macOS it can stay pending forever when the link drops mid-pass, so `watch` abandons
+the pass, releases the link, and retries.
+
 ## Gating
 
 - Skips if a sync is already ongoing.

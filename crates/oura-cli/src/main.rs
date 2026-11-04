@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
 use oura_link::ble::{self, BleTransport};
+use oura_link::client::SyncOutcome;
 use oura_link::OuraClient;
 use oura_store::storage::Store;
 
@@ -65,6 +66,25 @@ enum Command {
         /// Do not align the ring clock to host UTC before syncing. Without the
         /// time-sync anchor the ring writes, nights recorded since its last reboot
         /// cannot be placed on the calendar and the dashboard withholds them.
+        #[arg(long)]
+        no_sync_time: bool,
+    },
+    /// Keep syncing in the background: connect, drain, disconnect, wait, repeat —
+    /// so you don't have to park the ring on its charger. A pass that can't reach
+    /// the ring (worn, out of range, or still held by a phone) backs off and
+    /// retries; the persisted cursor means no event is missed. Ctrl-C to stop.
+    Watch {
+        /// Seconds to wait between successful syncs.
+        #[arg(long, default_value_t = 300)]
+        interval: u64,
+        /// Base seconds to wait after a failed/unreachable pass before retrying.
+        /// The wait doubles on each consecutive failure, up to `--max-backoff`.
+        #[arg(long, default_value_t = 20)]
+        retry: u64,
+        /// Upper bound (seconds) on the retry back-off between failed passes.
+        #[arg(long, default_value_t = 300)]
+        max_backoff: u64,
+        /// Do not align the ring clock to host UTC before each sync (see `sync`).
         #[arg(long)]
         no_sync_time: bool,
     },
@@ -260,6 +280,12 @@ async fn main() -> Result<()> {
         Command::Info => cmd_info(&cli, &key).await,
         Command::FactoryReset { yes } => cmd_factory_reset(&cli, &key, *yes).await,
         Command::Sync { no_sync_time, .. } => cmd_sync(&cli, &key, !*no_sync_time).await,
+        Command::Watch {
+            interval,
+            retry,
+            max_backoff,
+            no_sync_time,
+        } => cmd_watch(&cli, &key, !*no_sync_time, *interval, *retry, *max_backoff).await,
         Command::Latest => cmd_latest(&cli, &key).await,
         Command::LiveHr { seconds, raw } => cmd_live_hr(&cli, &key, *seconds, *raw).await,
         Command::Accel { seconds } => cmd_accel(&cli, &key, *seconds).await,
@@ -598,13 +624,15 @@ async fn cmd_factory_reset(cli: &Cli, key: &Option<[u8; 16]>, yes: bool) -> Resu
     Ok(())
 }
 
-async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<()> {
-    let key = key
-        .as_ref()
-        .ok_or_else(|| anyhow!("sync requires --key-file (history events are auth-gated)"))?;
-
-    let client = connect(cli).await?;
-    client.authenticate(key).await.context("authenticating")?;
+/// One full incremental sync over an already-connected, authenticated client:
+/// app-stream registration, optional clock alignment, a sleep-analysis nudge, then
+/// the history-event drain committed to `store` batch-by-batch with its cursor.
+/// Shared by `sync` (a single pass) and `watch` (one pass per interval).
+async fn sync_once(
+    client: &OuraClient<BleTransport>,
+    store: &Store,
+    sync_time: bool,
+) -> Result<SyncOutcome> {
     client
         .setup_app_stream()
         .await
@@ -629,7 +657,6 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
     let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
     let info = client.firmware().await.ok();
 
-    let store = Store::open(&cli.db)?;
     store.upsert_device(&serial, None, info.as_ref())?;
 
     let cursor = store.cursor(&serial)?;
@@ -704,8 +731,157 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
         outcome.events_synced, inserted, outcome.next_cursor
     );
 
+    Ok(outcome)
+}
+
+/// A single sync pass: connect, authenticate, drain into the DB, disconnect.
+async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<()> {
+    let key = key
+        .as_ref()
+        .ok_or_else(|| anyhow!("sync requires --key-file (history events are auth-gated)"))?;
+
+    let client = connect_and_auth(cli, key).await?;
+    let store = Store::open(&cli.db)?;
+    sync_once(&client, &store, sync_time).await?;
+
     let _ = client.transport().disconnect().await;
     Ok(())
+}
+
+/// Connect to the ring and run app-level authentication with `key`. Auth is
+/// per-connection, so every (re)connect must re-authenticate before any
+/// auth-gated request (`watch` does so on each pass).
+async fn connect_and_auth(cli: &Cli, key: &[u8; 16]) -> Result<OuraClient<BleTransport>> {
+    let client = connect(cli).await?;
+    client.authenticate(key).await.context("authenticating")?;
+    Ok(client)
+}
+
+/// Background auto-sync: connect → drain → disconnect, then wait and repeat, so
+/// data keeps flowing without parking the ring on its charger. A pass that can't
+/// reach the ring (worn, out of range, or still held by a phone) is not fatal —
+/// the loop backs off and retries, and the persisted cursor means the next
+/// successful pass resumes exactly where it left off. Ctrl-C stops it.
+async fn cmd_watch(
+    cli: &Cli,
+    key: &Option<[u8; 16]>,
+    sync_time: bool,
+    interval: u64,
+    retry: u64,
+    max_backoff: u64,
+) -> Result<()> {
+    let key = key
+        .as_ref()
+        .ok_or_else(|| anyhow!("watch requires --key-file (history events are auth-gated)"))?;
+    let store = Store::open(&cli.db)?;
+
+    println!(
+        "Watching \"{}\": syncing every {interval}s, retry back-off {}..{}s on failure. Ctrl-C to stop.",
+        cli.name,
+        retry.max(1),
+        max_backoff.max(retry).max(1),
+    );
+
+    // Ctrl-C ends the watch with a normal exit. Dropping an in-flight pass is safe:
+    // every batch it committed has already advanced the cursor.
+    tokio::select! {
+        r = watch_loop(cli, key, &store, sync_time, interval, retry, max_backoff) => r,
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nStopping watch.");
+            Ok(())
+        }
+    }
+}
+
+/// The `watch` body: on success wait `interval`; on failure wait a back-off that
+/// doubles from `retry` up to `max_backoff`, reset after the next success. Only
+/// ever returns via Ctrl-C (every sync error is caught and retried).
+async fn watch_loop(
+    cli: &Cli,
+    key: &[u8; 16],
+    store: &Store,
+    sync_time: bool,
+    interval: u64,
+    retry: u64,
+    max_backoff: u64,
+) -> Result<()> {
+    let base = Duration::from_secs(retry.max(1));
+    let cap = Duration::from_secs(max_backoff.max(retry).max(1));
+    let mut backoff = base;
+    loop {
+        match watch_sync_once(cli, key, store, sync_time).await {
+            Ok(outcome) => {
+                backoff = base;
+                println!(
+                    "[{}] pass ok: {} events this pass; next in {interval}s.",
+                    local_clock(),
+                    outcome.events_synced,
+                );
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[{}] pass failed: {e:#}. Retrying in {}s.",
+                    local_clock(),
+                    backoff.as_secs(),
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(cap);
+            }
+        }
+    }
+}
+
+/// How long `watch` gives one pass to authenticate and drain before treating the
+/// link as wedged. A pass takes seconds (a large backlog, a few minutes), but macOS
+/// can leave a BLE write-with-response pending forever when a worn ring drops the
+/// link mid-pass — one such pass sat for six hours. The drain checkpoints every
+/// batch, so abandoning a pass loses nothing: the next one resumes from the cursor.
+const WATCH_PASS_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Connect (bounded by the scan and connect deadlines), then authenticate and sync
+/// once within [`WATCH_PASS_TIMEOUT`], then always disconnect — without waiting on a
+/// dead link — so a failed pass never leaves the ring's single peripheral link held,
+/// or the next pass can't connect.
+async fn watch_sync_once(
+    cli: &Cli,
+    key: &[u8; 16],
+    store: &Store,
+    sync_time: bool,
+) -> Result<SyncOutcome> {
+    let client = connect(cli).await?;
+    let pass = async {
+        client.authenticate(key).await.context("authenticating")?;
+        sync_once(&client, store, sync_time).await
+    };
+    let outcome = tokio::time::timeout(WATCH_PASS_TIMEOUT, pass)
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "ring stopped responding; pass abandoned after {} min",
+                WATCH_PASS_TIMEOUT.as_secs() / 60
+            ))
+        });
+    let _ = tokio::time::timeout(Duration::from_secs(5), client.transport().disconnect()).await;
+    outcome
+}
+
+/// `HH:MM:SS` on this machine's local clock, to stamp unattended `watch` lines
+/// (UTC, labelled, where libc has no local-time lookup).
+fn local_clock() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    #[cfg(unix)]
+    {
+        let t = now as libc::time_t;
+        // SAFETY: localtime_r reads `t` and writes only the caller-owned `tm`.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec);
+        }
+    }
+    format!("{:02}:{:02}:{:02} UTC", now / 3600 % 24, now / 60 % 60, now % 60)
 }
 
 async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {

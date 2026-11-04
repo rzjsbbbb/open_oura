@@ -777,6 +777,7 @@ dependencies = [
  "clap",
  "getrandom",
  "hex",
+ "libc",
  "oura-link",
  "oura-protocol",
  "oura-store",

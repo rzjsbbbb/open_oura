@@ -53,10 +53,11 @@ cargo build --release
 ```
 
 See [`crates/README.md`](crates/README.md) for all commands (`scan`, `pair`,
-`factory-reset`, `info`, `sync`, `latest`, `live-hr`, `accel`, `features`,
+`factory-reset`, `info`, `sync`, `watch`, `latest`, `live-hr`, `accel`, `features`,
 `rdata`, `events`, `redecode`, `sleep-analyze`, `subscribe`, `feature-mode`,
 and `feature-status`) and the auth-key details. Destructive commands (`factory-reset`)
-require `--yes`.
+require `--yes`. `watch` keeps syncing on an interval (reconnecting each pass, with
+back-off when the ring is unreachable) so you needn't park the ring on its charger.
 
 ## Research bench (Python)
 
