@@ -100,3 +100,6 @@ local/libtorch-ios/pytorch/build_ios_device/
 
 # Working plan drafts kept out of the repo (self-declared "not committed").
 PLAN-*.md
+
+# model key capture output
+tools/oura_model_key_findings.jsonl

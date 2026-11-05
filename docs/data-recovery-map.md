@@ -70,9 +70,16 @@ So **sleep staging and activity MET-binning happen on the ring**, not the cloud.
 
 ### B. Live / realtime (UI-driven only)
 
-- **Live HR**: `SetFeatureMode(CAP_DAYTIME_HR, CONNECTED_LIVE)` -> ring pushes IBI
-  notifications (tag `0x2f`, sub-tag `40`) -> app computes `BPM = 60000 / IBI_ms`,
-  shown only when IBI validity == VALID. Stop with mode `AUTOMATIC`.
+- **Live HR**: `SetFeatureSubscription(CAP_DAYTIME_HR, LATEST)` (`2f03260202`) +
+  `SetFeatureMode(CAP_DAYTIME_HR, CONNECTED_LIVE)` -> ring pushes one IBI notification
+  per beat (tag `0x2f`, sub-tag `40` = `0x28`: `2f 0f 28 02 <status> 02 0000 <ibi lo>
+  <ibi hi | validity<<4> …`) -> app computes `BPM = 60000 / IBI_ms`, shown only when
+  IBI validity == VALID. On a Ring 4 (fw 2.12.15, 2026-11-05) **without the LATEST
+  subscription CONNECTED_LIVE is ACKed (`2f03230200`) and nothing is pushed**;
+  `FEATURE_DATA` (0x04) does not start it either. First beat ~10 s after start
+  (sensor warm-up), then ~1 frame/beat. Stop with mode `AUTOMATIC` and subscription
+  `OFF`. (open_health's `oura live-hr` does this; oura-link's `live_heart_rate` alone
+  only sets the mode.)
 - **Feature latest values** (poll): `GetFeatureLatestValues` (tag `0x2f` ext `0x24`)
   for `CAP_DAYTIME_HR` (last IBI), `CAP_EXERCISE_HR` (direct bpm), `CAP_SPO2`
   (SpO2% + bpm), `CAP_CHARGING_CONTROL`.
